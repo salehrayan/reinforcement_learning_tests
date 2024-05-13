@@ -19,33 +19,68 @@ from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import EarlyStopping
 
 device = 'cpu'
-env = gym.make("LunarLander-v2")
-env.reset()
 
-class DQN(nn.Module):
 
-    def __init__(self, hidden_size, obs_size, n_actions):
+class NafDQN(nn.Module):
+
+    def __init__(self, hidden_size, obs_size, action_dims, max_action):
         super().__init__()
+        self.action_dims = action_dims
+        self.max_action = torch.from_numpy(max_action).to(device)
         self.net = nn.Sequential(
             nn.Linear(obs_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, n_actions)
         )
+        self.linear_mu = nn.Linear(hidden_size, action_dims)
+        self.linear_value = nn.Linear(hidden_size, 1)
+        self.linear_matrix = nn.Linear(hidden_size, int(action_dims * (action_dims + 1) / 2))
 
-    def forward(self, x):
-        return self.net(x.float())
+    # Mu: computes the action with the highest Q-value
+    @torch.no_grad()
+    def mu(self, x):
+        x = self.net(x)
+        x = self.linear_mu(x)
+        x = torch.tanh(x) * self.max_action
+        return x
 
-def epsilon_greedy(state, net, n_actions, epsilon=0.0):
-    if np.random.random() < epsilon:
-        action = np.random.randint(n_actions)
+    # Compute state value
+    @torch.no_grad()
+    def value(self, x):
+        x = self.net(x)
+        x = self.linear_value(x)
+        return x
 
-    else:
-        state = torch.from_numpy(state).to(device).unsqueeze(0)
-        q_values = net(state)
-        _, action = torch.max(q_values, dim=1)
-        action = int(action.item())  #realized that I'm in continious space not discrete
+    def forward(self, x, a):
+        x = self.net(x)
+        mu = torch.tanh(self.linear_mu(x)) * self.max_action
+        value = self.linear_value(x)
+
+        # P(x)
+        matrix = torch.tanh(self.linear_matrix(x))
+
+        L = torch.zeros(x.shape[0], self.action_dims, self.action_dims).to(device)
+        tril_indices = torch.tril_indices(row=self.action_dims, col=self.action_dims).to(device)
+        L[:, tril_indices[0], tril_indices[1]] = matrix
+        L.diagonal(dim1=1, dim2=2).exp_()
+        P = L * L.transpose(2, 1)
+
+        u_mu = (a-mu).unsqueeze(1)
+        u_mu_t = u_mu.transpose(1, 2)
+
+        adv = -1 / 2 * u_mu @ P @ u_mu_t
+        adv = adv.squeeze(dim=-1)
+        return value + adv
+
+def noisy_policy(state, env, net, epsilon=0.0):
+
+    state = torch.from_numpy(state).to(device).unsqueeze(0)
+    amin = torch.from_numpy(env.action_space.low).to(device)
+    amax = torch.from_numpy(env.action_space.high).to(device)
+    mu = net.mu(state)
+    mu = mu + torch.normal(mean=0, std=epsilon, size=mu.size()).to(device)
+    action = mu.clamp(min=amin, max=amax)
+    action = action.squeeze().cpu().numpy()
     return action
 
 
@@ -74,22 +109,48 @@ class RLDataset(IterableDataset):
         for experience in self.buffer.sample(self.sample_size):
             yield experience
 
+class RepeatActionWrapper(gym.Wrapper):
 
+    def __init__(self, env, n):
+        super().__init__(env)
+        self.env = env
+        self.n = n
 
-class DeepQLearning(LightningModule):
+    def step(self, action):
+        total_reward = 0.0
+
+        for _ in range(self.n):
+            next_state, reward, done1, done2, info = self.env.step(action)
+            total_reward += reward
+            if done1 | done2:
+                break
+        return next_state, total_reward, done1, done2, info
+
+"######################################################################"
+env = gym.make("LunarLander-v2", continuous=True)
+env = RepeatActionWrapper(env, n=7)
+env.reset()
+"######################################################################"
+
+def polyak_averaging(net, target_network, tau=0.01):
+    for qp, tp in zip(net.parameters(), target_network.parameters()):
+        tp.data.copy_(tau * qp.data + (1 - tau) * tp.data)
+
+class NAFDeepQLearning(LightningModule):
 
     # Initialize
-    def __init__(self, max_steps, save_location, policy=epsilon_greedy, capacity=100_000,
-                 batch_size=32, lr=1e-3, hidden_size=128, gamma=0.99,
-                 loss_fn=F.smooth_l1_loss, optim=AdamW, eps_start=1,
-                 eps_end=0.15, eps_last_episode=100, samples_per_epoch=10_000,
-                 sync_rate=10, n_steps=3):
+    def __init__(self, max_steps, save_location, policy=noisy_policy, capacity=100_000,
+                 batch_size=32, lr=1e-4, hidden_size=512, gamma=0.99,
+                 loss_fn=F.smooth_l1_loss, optim=AdamW, eps_start=2.0,
+                 eps_end=0.2, eps_last_episode=1000, samples_per_epoch=1_000,
+                 tau=0.01, n_steps=3):
         super().__init__()
         self.env = env
-        self.n_actions = self.env.action_space.n
+        self.action_dims = self.env.action_space.shape[0]
+        self.max_actions = self.env.action_space.high
 
         obs_size = self.env.observation_space.shape[0]
-        self.q_net = DQN(hidden_size, obs_size, self.n_actions)
+        self.q_net = NafDQN(hidden_size, obs_size, self.action_dims, self.max_actions).to(device)
 
 
         self.target_q_net = copy.deepcopy(self.q_net)
@@ -120,7 +181,7 @@ class DeepQLearning(LightningModule):
 
         while not done and n_step < self.hparams.max_steps:
             if policy:
-                action = policy(state, self.q_net, n_actions=self.n_actions, epsilon=epsilon)
+                action = policy(state, self.env, self.q_net, epsilon=epsilon)
             else:
                 action = self.env.action_space.sample()
             next_state, reward, done1, done2, info = self.env.step(action)
@@ -142,7 +203,7 @@ class DeepQLearning(LightningModule):
             self.buffer.append((s, a, ret, ld, ls))
 
         self.episode_reward_history.append(reward_accumulate)
-        self.log('epoch_reward_history', reward_accumulate)
+        # self.log('epoch_reward_history', reward_accumulate)
 
         if (self.current_epoch+1) % 50 == 0:
             self.save_reward_plots(self.step_reward_history, self.episode_reward_history, self.hparams.save_location)
@@ -150,7 +211,8 @@ class DeepQLearning(LightningModule):
 
     # Forward
     def forward(self, x):
-        return self.q_net(x)
+        output = self.q_net.mu(x)
+        return output
 
     # Configure optimizers
     def configure_optimizers(self):
@@ -170,18 +232,18 @@ class DeepQLearning(LightningModule):
     def training_step(self, batch, batch_idx):
         self.q_net.train()
         states, actions, returns, dones, next_states = batch
-        actions = actions.unsqueeze(1)
+        # actions = actions.unsqueeze(1)
         returns = returns.unsqueeze(1)
         dones = dones.unsqueeze(1)
 
-        state_action_values = self.q_net(states).gather(1, actions.type(torch.int64))
+        action_values = self.q_net(states, actions)
 
-        next_action_values, _ = self.target_q_net(next_states).max(dim=1, keepdim=True)
-        next_action_values[dones] = 0.0
+        next_state_values = self.target_q_net.value(next_states)
+        next_state_values[dones] = 0.0
 
-        expected_state_action_values = returns + self.hparams.gamma**self.hparams.n_steps * next_action_values
+        target = returns + self.hparams.gamma * next_state_values
 
-        loss = self.hparams.loss_fn(state_action_values, expected_state_action_values)
+        loss = self.hparams.loss_fn(target, action_values)
         self.log('episode/Q-Error', loss)
         return loss
 
@@ -193,18 +255,18 @@ class DeepQLearning(LightningModule):
 
         self.play_episode(policy=self.policy, epsilon=epsilon)
 
-        if self.current_epoch % self.hparams.sync_rate == 0:
-            self.target_q_net.load_state_dict(self.q_net.state_dict())
+        polyak_averaging(self.q_net, self.target_q_net, self.hparams.tau)
         if self.episode_reward_history[-1] > self.episode_reward_history[-2] :
             torch.save({'q_net_state_dict': self.q_net.state_dict()}, self.hparams.save_location + 'q_net_ckpt.pth')
 
+        self.log('epoch_reward_history', self.episode_reward_history[-1])
+
     def save_reward_plots(self, step_rewards, episode_rewards, location):
         # Calculate the Simple Moving Average (SMA) with a window size of 25
-        plt.ioff()
         sma = np.convolve(episode_rewards, np.ones(20) / 20, mode='valid')
 
         plt.figure()
-        plt.title("Episode Rewards N-Step DQN")
+        plt.title("Episode Rewards NAF_DQN")
         plt.plot(episode_rewards, label='Raw Reward', color='#142475', alpha=0.45)
         plt.plot(sma, label='SMA 20', color='#f0c52b')
         plt.xlabel("Episode")
@@ -219,7 +281,7 @@ class DeepQLearning(LightningModule):
         sma = np.convolve(step_rewards, np.ones(20) / 20, mode='valid')
 
         plt.figure()
-        plt.title("Step Rewards N-Step DQN")
+        plt.title("Step Rewards NAF_DQN")
         plt.plot(step_rewards, label='Raw Reward', color='#142475', alpha=0.45)
         plt.plot(sma, label='SMA 20', color='#f0c52b')
         plt.xlabel("Step")
@@ -236,7 +298,7 @@ class DeepQLearning(LightningModule):
         plt.close()
 
 
-algorithm = DeepQLearning(1000, save_location='./N_step_DQN/', n_steps=5)
+algorithm = NAFDeepQLearning(1000, save_location='./NAF_DQN/')
 early_stopping = EarlyStopping(monitor='epoch_reward_history', mode='max', patience=500)
 
 
