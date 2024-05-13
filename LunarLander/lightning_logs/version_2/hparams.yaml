@@ -1,0 +1,14 @@
+batch_size: 32
+capacity: 100000
+eps_end: 0.15
+eps_last_episode: 100
+eps_start: 1
+gamma: 0.7733186822078381
+hidden_size: 128
+loss_fn: !!python/name:torch.nn.functional.smooth_l1_loss ''
+lr: 0.006211547388720024
+max_steps: 1000
+optim: !!python/name:torch.optim.adamw.AdamW ''
+policy: !!python/name:__main__.epsilon_greedy ''
+samples_per_epoch: 200
+sync_rate: 10
