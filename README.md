@@ -1,4 +1,4 @@
-Testinf Reinforcement algorithms on Gym(nasium) environments.
+Testing Reinforcement algorithms on Gym(nasium) environments. The codes will eventually have or already have algorithms including but not limited to DQN, DQN + experience replay/PER/NoisyDQN/Distributional, DDPG, PPO, TRPO, Continuous_DQN, etc.
 
 Double_DQN_result_gif:
 
