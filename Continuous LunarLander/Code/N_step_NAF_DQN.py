@@ -20,7 +20,6 @@ from pytorch_lightning.callbacks import EarlyStopping
 
 device = 'cpu'
 
-
 class NafDQN(nn.Module):
 
     def __init__(self, hidden_size, obs_size, action_dims, max_action):
