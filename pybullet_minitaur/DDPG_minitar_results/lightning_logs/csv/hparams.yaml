@@ -1,0 +1,14 @@
+actor_lr: 0.001
+batch_size: 64
+capacity: 1000000
+critic_lr: 0.001
+eps_end: 0.2
+eps_last_episode: 500
+eps_start: 1
+gamma: 0.99
+hidden_size: 256
+loss_fn: !!python/name:torch.nn.functional.smooth_l1_loss ''
+max_steps: 1000
+optim: !!python/name:torch.optim.adamw.AdamW ''
+samples_per_epoch: 6400
+tau: 0.01

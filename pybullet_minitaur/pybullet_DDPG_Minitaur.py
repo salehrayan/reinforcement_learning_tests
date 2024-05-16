@@ -1,3 +1,8 @@
+import pybullet as p
+import pybullet_data
+import pybullet_envs
+import pybullet_envs.bullet.minitaur_gym_env as e
+
 import copy
 import functools
 import random
@@ -23,31 +28,13 @@ from torch.utils.data.dataset import IterableDataset
 from torch.optim import AdamW
 
 from pytorch_lightning import LightningModule, Trainer
-from pytorch_lightning.callbacks import EarlyStopping
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 
 
-device = 'cpu'
+env = e.MinitaurBulletEnv(render=False)
+device='cpu'
 
-env = envs.create('ant',batch_size=512, episode_length=1000)
-env = gym_wrapper.VectorGymWrapper(env)
-env = torch_wrapper.TorchWrapper(env, device=device)
-
-
-@torch.no_grad()
-def test_env(env_name, policy=None):
-  env = envs.create('ant', batch_size=1, episode_length=1000)
-  env = gym_wrapper.VectorGymWrapper(env)
-  env = torch_wrapper.TorchWrapper(env, device=device)
-  qp_array = []
-  state = env.reset()
-  for i in range(1000):
-    if policy:
-      action = policy.mu(state)
-    else:
-      action = env.action_space.sample()
-    state, _, _, _ = env.step(action)
-    qp_array.append(env.render('rgb_array'))
-  return qp_array
 class GradientPolicy(nn.Module):
 
     def __init__(self, hidden_size, obs_size, out_dims, min, max):
@@ -127,18 +114,18 @@ def polyak_averaging(net, target_network, tau=0.01):
 
 class DDPG(LightningModule):
 
-    def __init__(self, save_location, capacity=10_000, batch_size=512, actor_lr=1e-4, critic_lr=1e-4,
+    def __init__(self, max_steps=1000, capacity=1_000_000, batch_size=64, actor_lr=1e-3, critic_lr=1e-3,
                  hidden_size=256, gamma=0.99, loss_fn=F.smooth_l1_loss, optim=AdamW,
-                 eps_start=1, eps_end=0.2, eps_last_episode=500, samples_per_epoch=20,
+                 eps_start=1, eps_end=0.2, eps_last_episode=500, samples_per_epoch=64*100,
                  tau=0.01):
         super().__init__()
         self.env = env
-        self.obs = self.env.reset()
-        self.videos = []
+        self.env.reset()
+        # self.videos = []
         self.automatic_optimization = False
 
-        obs_size = self.env.observation_space.shape[1]
-        self.action_dims = self.env.action_space.shape[1]
+        obs_size = self.env.observation_space.shape[0]
+        self.action_dims = self.env.action_space.shape[0]
         min_action = self.env.action_space.low
         max_action = self.env.action_space.high
 
@@ -152,31 +139,31 @@ class DDPG(LightningModule):
 
         self.save_hyperparameters()
 
-        self.reward_history = []
-        os.makedirs(self.hparams.save_location, exist_ok=True)
-
         while len(self.buffer) < self.hparams.samples_per_epoch:
             print(f"{len(self.buffer)} samples in experience buffer. Filling...")
             self.play(epsilon=self.hparams.eps_start)
 
     @torch.no_grad()
     def play(self, policy=None, epsilon=0.):
-        if policy:
-            action = policy(self.obs, epsilon=epsilon)
-        else:
-            action = env.action_space.sample()
-        next_obs, reward, done, info = self.env.step(torch.from_numpy(action))
 
-        exp = (self.obs, action, reward, done, next_obs)
-        self.buffer.append(exp)
-        self.obs = next_obs
-        reward_mean =  reward.mean()
+        state = self.env.reset()
+        done = False
+        reward_accumulate = 0
+        n_step = 0
 
-        self.reward_history.append(reward_mean)
+        while not done and n_step < self.hparams.max_steps:
+            if policy:
+                action = policy(state, epsilon=epsilon)
+            else:
+                action = self.env.action_space.sample()
+            next_state, reward, done, info = self.env.step(action)
+            exp = (state, action, reward, done, next_state)
+            self.buffer.append(exp)
+            state = next_state
+            reward_accumulate = reward_accumulate + reward
 
-
-        return reward_mean
-
+            n_step += 1
+        return reward_accumulate.mean()
     def forward(self, x):
         output = self.policy.mu(x)
         return output
@@ -190,7 +177,7 @@ class DDPG(LightningModule):
         dataset = RLDataset(self.buffer, self.hparams.samples_per_epoch)
         dataloader = DataLoader(
             dataset = dataset,
-            batch_size=1
+            batch_size= self.hparams.batch_size
         )
         return dataloader
 
@@ -236,9 +223,7 @@ class DDPG(LightningModule):
 
 
 
-
-
-dir_path = "/content/drive/MyDrive/DDPG_ant_brax/"
+dir_path = "./DDPG_minitar_results/"
 
 algorithm = DDPG()
 early_stopping = EarlyStopping(monitor='mean_rewards', mode='max', patience=500)
@@ -248,8 +233,8 @@ ckpt_callback = ModelCheckpoint(dir_path, monitor='mean_rewards', filename='{epo
 
 # algorithm.load_from_checkpoint()
 trainer = Trainer(
-    accelerator="cpu", max_epochs=10_000, callbacks=[early_stopping, ckpt_callback], logger=[tb_logger, csv_logger],
-    default_root_dir="/content/drive/MyDrive/DDPG_ant_brax/", log_every_n_steps=1
+    accelerator="cpu", max_epochs=10_000, callbacks=[early_stopping, ckpt_callback], logger=[tb_logger, csv_logger], log_every_n_steps=1,
+default_root_dir=dir_path
 )
 
 trainer.fit(algorithm)
