@@ -13,6 +13,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 import torch.nn.functional as F
+from torch.distributions import Normal
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
 from torch.utils.data.dataset import IterableDataset
@@ -28,32 +29,34 @@ device='cpu'
 
 class GradientPolicy(nn.Module):
 
-    def __init__(self, hidden_size, obs_size, out_dims, min, max):
+    def __init__(self, hidden_size, obs_size, out_dims, max):
         super().__init__()
-        self.min = torch.from_numpy(min).to(device)
         self.max = torch.from_numpy(max).to(device)
         self.net = nn.Sequential(nn.Linear(obs_size, hidden_size),
                                  nn.ReLU(),
                                  nn.Linear(hidden_size, hidden_size),
-                                 nn.ReLU(),
-                                 nn.Linear(hidden_size, out_dims),
-                                 nn.Tanh())
+                                 nn.ReLU())
 
-    def mu(self, x):
-        if isinstance(x, np.ndarray):
-            x = torch.from_numpy(x).to(device)
-        return self.net(x.float()) * self.max[0]
+        self.linear_mu = nn.Linear(hidden_size, out_dims)
+        self.linear_std = nn.Linear(hidden_size, out_dims)
 
-    def forward(self, x, epsilon, noise_clip=None):
-        mu = self.mu(x)
-        noise = torch.normal(0, epsilon, size=mu.size(), device=mu.device)
-        if noise_clip is not None:
-            noise = torch.clamp(noise, -noise_clip, noise_clip)
-        mu = mu + noise
-        action = mu.clamp(min=self.min, max=self.max)
-        action = action.detach().cpu().numpy()
-        return action
+    def forward(self, obs):
+        if isinstance(obs, np.ndarray):
+            obs = torch.from_numpy(obs).to(device)
+        x = self.net(obs.float())
+        mu = self.linear_mu(x)
+        std = self.linear_std(x)
+        std = F.softplus(std) + 1e-3
 
+        dist = Normal(mu, std)
+        action = dist.rsample()
+        log_prob = dist.log_prob(action)
+        log_prob = log_prob.sum(dim=-1, keepdim=True)
+        log_prob -= (2 * (np.log(2) - action - F.softplus(-2 * action))).sum(dim=-1, keepdim=True)
+
+        action = torch.tanh(action) * self.max
+
+        return action, log_prob
 class DQN(nn.Module):
 
     def __init__(self, hidden_size, obs_size, out_dims):
@@ -106,11 +109,11 @@ def polyak_averaging(net, target_network, tau=0.01):
         tp.data.copy_(tau * qp.data + (1 - tau) * tp.data)
 
 
-class TD3(LightningModule):
+class SAC(LightningModule):
 
-    def __init__(self, max_steps=1000, capacity=1_000_000, batch_size=64, actor_lr=5e-4, critic_lr=5e-4,
+    def __init__(self, max_steps=1000, capacity=100_000, batch_size=128, lr=1e-3,
                  hidden_size=256, gamma=0.99, loss_fn=F.smooth_l1_loss, optim=AdamW,
-                 eps_start=1, eps_end=0.2, eps_last_episode=500, samples_per_epoch=64*100,
+                 epsilon=0.05, alpha=0.02, samples_per_epoch=128*10,
                  tau=0.01):
         super().__init__()
         self.env = env
@@ -120,12 +123,11 @@ class TD3(LightningModule):
 
         obs_size = self.env.observation_space.shape[0]
         self.action_dims = self.env.action_space.shape[0]
-        min_action = self.env.action_space.low
         max_action = self.env.action_space.high
 
         self.q_net1 = DQN(hidden_size, obs_size, self.action_dims)
         self.q_net2 = DQN(hidden_size, obs_size, self.action_dims)
-        self.policy = GradientPolicy(hidden_size, obs_size, self.action_dims, min_action, max_action)
+        self.policy = GradientPolicy(hidden_size, obs_size, self.action_dims, max_action)
 
         self.target_policy = copy.deepcopy(self.policy)
         self.target_q_net1 = copy.deepcopy(self.q_net1)
@@ -137,10 +139,10 @@ class TD3(LightningModule):
 
         while len(self.buffer) < self.hparams.samples_per_epoch:
             print(f"{len(self.buffer)} samples in experience buffer. Filling...")
-            self.play(epsilon=self.hparams.eps_start)
+            self.play_episode()
 
     @torch.no_grad()
-    def play(self, policy=None, epsilon=0.):
+    def play_episode(self, policy=None):
 
         state = self.env.reset()[0]
         done = False
@@ -148,8 +150,9 @@ class TD3(LightningModule):
         n_step = 0
 
         while not done and n_step < self.hparams.max_steps:
-            if policy:
-                action = policy(state, epsilon=epsilon)
+            if policy and random.random() > self.hparams.epsilon:
+                action, _ = policy(state)
+                action = action.cpu().numpy()
             else:
                 action = self.env.action_space.sample()
             next_state, reward, done1, done2, info = self.env.step(action)
@@ -167,8 +170,8 @@ class TD3(LightningModule):
 
     def configure_optimizers(self):
         q_net_params = itertools.chain(self.q_net1.parameters(), self.q_net2.parameters())
-        q_net_optimizers = self.hparams.optim(q_net_params, lr=self.hparams.critic_lr)
-        policy_optimizer = self.hparams.optim(self.policy.parameters(), lr=self.hparams.actor_lr)
+        q_net_optimizers = self.hparams.optim(q_net_params, lr=self.hparams.lr)
+        policy_optimizer = self.hparams.optim(self.policy.parameters(), lr=self.hparams.lr)
         return [q_net_optimizers, policy_optimizer]
 
     def train_dataloader(self):
@@ -183,16 +186,6 @@ class TD3(LightningModule):
 
         q_net_optimizers, policy_optimizer = self.optimizers()
 
-        epsilon = max(self.hparams.eps_end,
-                      self.hparams.eps_start - self.current_epoch / self.hparams.eps_last_episode)
-
-        mean_rewards = self.play(policy=self.policy, epsilon=epsilon)
-        self.log("mean_rewards", mean_rewards)
-
-        polyak_averaging(self.q_net1, self.target_q_net1, tau=self.hparams.tau)
-        polyak_averaging(self.q_net2, self.target_q_net2, tau=self.hparams.tau)
-        polyak_averaging(self.policy, self.target_policy, tau=self.hparams.tau)
-
         states, actions, rewards, dones, next_states = map(torch.squeeze, batch)
         rewards = rewards.unsqueeze(1)
         dones = dones.unsqueeze(1).bool()
@@ -200,11 +193,11 @@ class TD3(LightningModule):
 
         action_values1 = self.q_net1(states, actions)
         action_values2 = self.q_net2(states, actions)
-        next_actions = self.target_policy(next_states, epsilon=epsilon, noise_clip=0.05)
-        next_action_values = torch.min(self.target_q_net1(next_states, next_actions).detach(),
-                                       self.target_q_net2(next_states, next_actions).detach())
+        target_actions, target_log_probs = self.target_policy(next_states)
+        next_action_values = torch.min(self.target_q_net1(next_states, target_actions).detach(),
+                                       self.target_q_net2(next_states, target_actions).detach())
         next_action_values[dones] = 0.
-        target = rewards + self.hparams.gamma * next_action_values
+        target = rewards + self.hparams.gamma * (next_action_values - self.hparams.alpha * target_log_probs)
 
         q_loss1 = self.hparams.loss_fn(action_values1, target)
         q_loss2 = self.hparams.loss_fn(action_values2, target)
@@ -215,25 +208,34 @@ class TD3(LightningModule):
         self.manual_backward(q_loss)
         q_net_optimizers.step()
 
-        if batch_idx % 2 == 0:
-            mu = self.policy.mu(states)
-            policy_loss = -self.q_net1(states, mu).mean()
-            self.log('Policy-Loss', policy_loss)
-            q_net_optimizers.zero_grad()
-            policy_optimizer.zero_grad()
-            self.manual_backward(policy_loss)
-            policy_optimizer.step()
+        actions, log_probs = self.policy(states)
+        action_values = torch.min(self.q_net1(states, actions),
+                                  self.q_net2(states, actions))
+        policy_loss = - (action_values - self.hparams.alpha * log_probs).mean()
+        self.log('Policy-Loss', policy_loss)
+        q_net_optimizers.zero_grad()
+        policy_optimizer.zero_grad()
+        self.manual_backward(policy_loss)
+        policy_optimizer.step()
 
 
+    def on_train_epoch_end(self):
+        mean_rewards = self.play_episode(policy=self.policy)
+        self.log("mean_rewards", mean_rewards, on_epoch=True)
 
-dir_path = "./TD3_Ant_results/"
+        polyak_averaging(self.q_net1, self.target_q_net2, tau=self.hparams.tau)
+        polyak_averaging(self.q_net2, self.target_q_net2, tau=self.hparams.tau)
+        polyak_averaging(self.policy, self.target_policy, tau=self.hparams.tau)
 
-algorithm = TD3()
+
+dir_path = "./SAC_Ant_results/"
+
+algorithm = SAC(alpha=0.005, tau=0.1)
 
 early_stopping = EarlyStopping(monitor='mean_rewards', mode='max', patience=500)
 tb_logger = TensorBoardLogger(dir_path, version='tensorboard')
 csv_logger = CSVLogger(dir_path, version='csv')
-ckpt_callback = ModelCheckpoint(dir_path, monitor='mean_rewards', filename='{epoch}-{mean_rewards:.4f}', every_n_epochs =50, mode='max')
+ckpt_callback = ModelCheckpoint(dir_path, monitor='mean_rewards', filename='{epoch}-{mean_rewards:.4f}', every_n_epochs =10, mode='max')
 
 # algorithm.load_from_checkpoint()
 trainer = Trainer(
