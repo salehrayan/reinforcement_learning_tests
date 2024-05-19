@@ -4,7 +4,6 @@ import random
 import time
 from collections import deque
 import os
-import jax
 
 import gymnasium as gym
 import torch
@@ -157,6 +156,7 @@ class SAC(LightningModule):
                 action = self.env.action_space.sample()
             next_state, reward, done1, done2, info = self.env.step(action)
             done = done1 | done2
+            done = done | (n_step+1==self.hparams.max_steps)
             exp = (state, action, reward, done, next_state)
             self.buffer.append(exp)
             state = next_state
@@ -189,7 +189,6 @@ class SAC(LightningModule):
         states, actions, rewards, dones, next_states = map(torch.squeeze, batch)
         rewards = rewards.unsqueeze(1)
         dones = dones.unsqueeze(1).bool()
-
 
         action_values1 = self.q_net1(states, actions)
         action_values2 = self.q_net2(states, actions)
@@ -242,7 +241,6 @@ trainer = Trainer(
     accelerator="cpu", max_epochs=10_000, callbacks=[early_stopping, ckpt_callback], logger=[tb_logger, csv_logger],
     default_root_dir=dir_path, log_every_n_steps=1
 )
-
 
 trainer.fit(algorithm)
 
